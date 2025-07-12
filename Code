@@ -1,0 +1,220 @@
+# Make sure you run this first
+!pip install --quiet torch torchvision matplotlib tqdm
+
+
+import os
+from pathlib import Path
+from PIL import Image
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, random_split
+from torchvision import transforms
+from torchvision.models import resnet50, ResNet50_Weights
+from tqdm.auto import tqdm
+import matplotlib.pyplot as plt
+
+
+# Adjust this path if you mount your Kaggle dataset differently
+DATA_DIR = '/kaggle/input/oily-dry-and-normal-skin-types-dataset/Oily-Dry-Skin-Types'
+
+# Map folder names → numeric labels
+LABELS = {'dry':0, 'normal':1, 'oily':2}
+
+class SkinTypeDataset(Dataset):
+    def __init__(self, root_dir, split='train', transform=None):
+        super().__init__()
+        self.transform = transform
+        self.samples = []
+        split_dir = Path(root_dir)/split
+        for label_name, idx in LABELS.items():
+            class_dir = split_dir/label_name
+            if not class_dir.exists():
+                continue
+            for img_path in class_dir.iterdir():
+                if img_path.suffix.lower() in ('.jpg','.png','.jpeg'):
+                    self.samples.append((str(img_path), idx))
+    def __len__(self):
+        return len(self.samples)
+    def __getitem__(self, i):
+        path, label = self.samples[i]
+        img = Image.open(path).convert('RGB')
+        if self.transform:
+            img = self.transform(img)
+        return img, label
+
+
+
+
+Please upload your dataset as a zip file. After uploading, we will extract it and update the `DATA_DIR` variable.
+
+from google.colab import files
+import zipfile
+import os
+
+uploaded = files.upload()
+
+for fn in uploaded.keys():
+  print('User uploaded file "{name}" with length {length} bytes'.format(
+      name=fn, length=len(uploaded[fn])))
+  # Unzip the file
+  zip_ref = zipfile.ZipFile(fn, 'r')
+  zip_ref.extractall('/content/dataset') # Extract to a directory named 'dataset'
+  zip_ref.close()
+  print(f"Extracted {fn} to /content/dataset")
+
+# Update DATA_DIR to the extracted dataset path
+DATA_DIR = '/content/dataset/Oily-Dry-Skin-Types' # Assuming the extracted folder structure is similar to the Kaggle dataset
+print(f"DATA_DIR updated to: {DATA_DIR}")
+
+# Load a pre-trained ResNet50 model
+weights = ResNet50_Weights.DEFAULT
+model = resnet50(weights=weights)
+
+# Modify the final layer for our classification task
+num_ftrs = model.fc.in_features
+model.fc = nn.Linear(num_ftrs, len(LABELS))
+
+# Define loss function and optimizer
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+# Move model to GPU if available
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
+
+print(f"Using device: {device}")
+
+# Data augmentation for training
+train_tf = transforms.Compose([
+    transforms.RandomResizedCrop(224),
+    transforms.RandomHorizontalFlip(),
+    transforms.ColorJitter(0.2,0.2,0.2,0.1),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485,0.456,0.406],
+                         std=[0.229,0.224,0.225]),
+])
+# Simple validation/test transforms
+val_tf = transforms.Compose([
+    transforms.Resize(256),
+    transforms.CenterCrop(224),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485,0.456,0.406],
+                         std=[0.229,0.224,0.225]),
+])
+
+# Create datasets
+full_train = SkinTypeDataset(DATA_DIR, 'train', transform=train_tf)
+val      = SkinTypeDataset(DATA_DIR, 'valid', transform=val_tf)
+test     = SkinTypeDataset(DATA_DIR, 'test',  transform=val_tf)
+
+# Check if the dataset is empty
+if len(full_train) == 0:
+    raise ValueError(f"Training dataset is empty. Please check if the path {DATA_DIR}/train is correct and contains images.")
+
+# Wrap in DataLoaders
+train_dl = DataLoader(full_train, batch_size=32, shuffle=True,  num_workers=2)
+val_dl   = DataLoader(val,      batch_size=32, shuffle=False, num_workers=2)
+test_dl  = DataLoader(test,     batch_size=32, shuffle=False, num_workers=2)
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Load pretrained ResNet50
+model = resnet50(weights=ResNet50_Weights.DEFAULT)
+model.fc = nn.Linear(model.fc.in_features, len(LABELS))  # 3 classes
+
+model = model.to(device)
+
+
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.SGD(model.parameters(), lr=1e-3, momentum=0.9)
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
+
+EPOCHS = 10
+best_val_acc = 0.0
+
+for epoch in range(1, EPOCHS+1):
+    # — Train —
+    model.train()
+    running_loss, running_corrects = 0.0, 0
+    for imgs, labs in tqdm(train_dl, desc=f"Epoch {epoch}/{EPOCHS} [Train]"):
+        imgs, labs = imgs.to(device), labs.to(device)
+        optimizer.zero_grad()
+        outs = model(imgs)
+        loss = criterion(outs, labs)
+        loss.backward()
+        optimizer.step()
+        preds = outs.argmax(1)
+        running_loss += loss.item() * imgs.size(0)
+        running_corrects += (preds==labs).sum().item()
+    scheduler.step()
+    epoch_loss = running_loss/len(full_train)
+    epoch_acc  = running_corrects/len(full_train)
+
+    # — Validate —
+    model.eval()
+    val_corrects = 0
+    with torch.no_grad():
+        for imgs, labs in val_dl:
+            imgs, labs = imgs.to(device), labs.to(device)
+            preds = model(imgs).argmax(1)
+            val_corrects += (preds==labs).sum().item()
+    val_acc = val_corrects/len(val)
+
+    print(f"Epoch {epoch} → Train: {epoch_loss:.3f}, {epoch_acc:.3%} | Val: {val_acc:.3%}")
+
+    # save best
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        torch.save(model.state_dict(), 'best_skin_type.pth')
+
+
+# load best weights
+model.load_state_dict(torch.load('best_skin_type.pth'))
+model.eval()
+test_corrects = 0
+with torch.no_grad():
+    for imgs, labs in test_dl:
+        imgs, labs = imgs.to(device), labs.to(device)
+        preds = model(imgs).argmax(1)
+        test_corrects += (preds==labs).sum().item()
+print(f"Test Accuracy: {test_corrects/len(test):.3%}")
+
+
+from google.colab import files
+import io
+from PIL import ImageDraw
+
+# Define colors for each label
+COLOR_MAP = {'dry': 'saddlebrown', 'normal': 'green', 'oily': 'red'}
+
+# 1) Upload an image file
+uploaded = files.upload()
+for fn in uploaded.keys():
+    img = Image.open(io.BytesIO(uploaded[fn])).convert('RGB')
+    inp = val_tf(img).unsqueeze(0).to(device)
+    with torch.no_grad():
+        pred = model(inp).argmax(1).item()
+    # map back to label name
+    label_name = {v:k for k,v in LABELS.items()}[pred]
+    print(f"► {fn} → Predicted Skin Type: {label_name.upper()}")
+
+    # Add colored border to the image
+    img_with_border = img.copy()
+    draw = ImageDraw.Draw(img_with_border)
+    border_color = COLOR_MAP.get(label_name, 'white') # Default to white if label not found
+    border_width = 10  # Adjust border width as needed
+    width, height = img_with_border.size
+    draw.rectangle([(0, 0), (width, height)], outline=border_color, width=border_width)
+
+    plt.imshow(img_with_border)
+    plt.title(f"Predicted: {label_name.upper()}", color=border_color)
+    plt.axis('off') # Hide axis
+    plt.show()
+
+
+
+from google.colab import files
+
+# Download the best trained model
+files.download('best_skin_type.pth')
